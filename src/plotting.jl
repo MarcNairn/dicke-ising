@@ -1,9 +1,15 @@
-using PyPlot
+# module Plotting
 
+
+using PyPlot
 using LinearAlgebra
 using LsqFit
 using Measurements
 using StatsBase
+
+
+# export plot_initial_conditions, plot_position, plot_spinspositionhisto, plot_contact_spatial_correlation, plot_contact_count, 
+#          plot_cavity_wigner, plot_collective_wigner
 
 
 function plot_initial_conditions(sim::Array{Sol,1})
@@ -59,7 +65,7 @@ function plot_initial_conditions(sim::Array{Sol,1})
     ax[2, 2][:step](pdfsz.edges[1][1:end-1],pdfsz.weights,label=L"\sigma^z",where="post", color = "mediumpurple", lw=1.5)
 
 
-    fig[:tight_layout](h_pad=0., w_pad=-0.)
+    # fig[:tight_layout](h_pad=0., w_pad=-0.)
 
     return fig, ax
 end
@@ -166,7 +172,7 @@ function plot_spinspositionhisto(sim::Array{Sol,1}; cmap="inferno")
     t = sol0.t
     Nt = length(t)
 
-    nbins = trunc(Int, ^(N,1//2))
+    nbins = trunc(Int, N/2)
 
     edges = collect(range(0.0, stop=2π, length=nbins+1))
     centers = 0.5 .* (edges[1:end-1] .+ edges[2:end])   
@@ -392,6 +398,92 @@ function plot_contact_count(sim; figsize=(10,4), show_individual=true, savefile=
         savefig(savefile)
     end
     return fig
+end
+
+
+
+function plot_spinphasehisto(sim::Array{Sol,1})
+    if isempty(sim)
+        error("No trajectories found in `sim`")
+    end
+
+    sol0 = sim[1]
+    N = sol0.p.N
+    t = sol0.t
+    Nt = length(t)
+
+    nbins = trunc(Int, ^(N,1//2))
+
+    edges = collect(range(0.0, stop=2π, length=nbins+1))
+    centers = 0.5 .* (edges[1:end-1] .+ edges[2:end])   
+
+
+    Sphase_mat = fill(NaN, nbins, Nt)
+    counts_mat = zeros(Int, nbins, Nt)
+
+    
+    for jj in 1:Nt
+        pos_pool = Float64[]
+        sphase_pool  = Float64[]
+        for sol in sim
+
+            x = mod.(sol.u[1:N, jj], 2π)           # positions in [0,2π)
+            sx = sol.u[(2N+1):(3N), jj]            # Sx per site
+            sz = sol.u[(4N+1):(5N), jj]            # Sz per site
+
+            spin_phase = atan.(sz ./ sx)
+
+            append!(pos_pool, x)
+            append!(sphase_pool, spin_phase)
+        end
+
+        
+        if !isempty(pos_pool)
+
+            h_counts = fit(Histogram, pos_pool, edges)
+            counts = copy(h_counts.weights) .|> Int
+
+
+            h_s = fit(Histogram, pos_pool, Weights(sphase_pool), edges)
+
+            # MEANS
+            for b in 1:nbins
+                counts_mat[b, jj] = counts[b]
+                if counts[b] > 0
+                    Sphase_mat[b, jj] = h_s.weights[b] / counts[b]
+                else
+                    Sphase_mat[b, jj] = NaN
+                end
+            end
+        end
+    end
+
+
+    sf = 1.5
+    fig, ax = subplots(1,1, figsize=[4.25*sf, 2.0*sf], sharex=true, sharey=true)
+
+    # extent: (x0, x1, y0, y1)
+    extent = (t[1], t[end], 0.0, 2π)
+
+    im1 = ax[:imshow](mod2pi.(Sphase_mat), origin="lower", aspect="auto", extent=extent, interpolation="nearest", cmap="Spectral",vmin=0, vmax=pi/2)
+    ax[:set_xlabel](L"t", labelpad=-4.5)
+    ax[:set_ylabel](L"x/\lambda_c")
+
+    yticks_positions = [0.0, π, 2π]
+    ax[:set_yticks](yticks_positions)
+    ax[:set_yticklabels]([L"0",  L"\pi",  L"2\pi"])
+
+    fig[:tight_layout](h_pad=0.0, w_pad=0.1)
+    fig[:subplots_adjust](right=0.88)
+    cbar_ax = fig[:add_axes]([0.90, 0.35, 0.02, 0.35])
+    cbar = fig[:colorbar](im1, cax=cbar_ax, label=L"\mathrm{arg}(\mathbf{S})")
+    cbar_ax.set_yticks([0,π/2], [0, L"\pi/2"])
+    ax.tick_params(direction="in", which="both")
+
+    cbar_ax.tick_params(direction="in", which="both")
+
+    display(fig)
+    return fig, (Sphase_mat, counts_mat, t, centers)
 end
 
 
@@ -683,3 +775,5 @@ function plot_g2(sim::Array{Sol,1})
 
     return fig
 end
+
+# end # module

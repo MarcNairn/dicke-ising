@@ -1,6 +1,7 @@
 
 ## Adapted code structure from spin self organization with core function calls
 
+# module custom_funtions
 
 using DifferentialEquations: EnsembleSolution, RODESolution, ODESolution
 
@@ -101,4 +102,4 @@ function keep_input_time(sim::Array{Sol,1}, required_t::Int)
     return sorted_sim
 end
 
-
+# end # module

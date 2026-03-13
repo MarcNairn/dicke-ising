@@ -1,19 +1,23 @@
-    # THIS SCRIPT SOLVES THE SDE OF THE MAIN TEXT THROUGH A DTWA MONTE CARLO SAMPLING TECHNIQUE
-    #
-    # for more info look up documentation on 
-    # https://docs.sciml.ai/DiffEqDocs/stable/features/ensemble
+"""THIS SCRIPT SOLVES THE SDE OF THE MAIN TEXT THROUGH A DTWA MONTE CARLO SAMPLING TECHNIQUE
+for more info look up documentation on  https://docs.sciml.ai/DiffEqDocs/stable/features/ensemble
+"""
 
-    
-#module Selforg 
+# module Main
 
-include("custom_functions.jl") # .imports module without running 
+
+
+include("custom_functions.jl")
+include("observables.jl")
+
 
 using Random
 using Statistics
-using LaTeXStrings
 using Printf
 using DataFrames
 using DifferentialEquations 
+
+
+
 
 
 # -------------------------
@@ -33,28 +37,16 @@ function circ_dist(x1, x2)
     return min(dx, 2pi - dx)
 end
 
-# function compute_chi_matrix(xwrap::Vector{Float64}, dressed_idx::Vector{Int}, rthresh::Float64)
-#     Nr = length(dressed_idx)
-#     chi = zeros(Float64, Nr, Nr)
-#     for ii in 1:Nr
-#         i = dressed_idx[ii]
-#         xi = xwrap[i]
-#         for jj in 1:Nr
-#             j = dressed_idx[jj]
-#             if i == j
-#                 chi[ii,jj] = 0.0
-#             else
-#                 dx = circ_dist(xi, xwrap[j])
-#                 if dx <= rthresh && dx > 1e-12
-#                     chi[ii,jj] = 1.0   # contact adjacency
-#                 else
-#                     chi[ii,jj] = 0.0
-#                 end
-#             end
-#         end
-#     end
-#     return chi
-# end
+
+@inline function U_softcore(r, V, Rc)
+    x = r / Rc
+    return V / (1 + x^6)
+end
+
+@inline function dU_softcore_dr(r, V, Rc)
+    x = r / Rc
+    return -6V * x^5 / (Rc * (1 + x^6)^2)
+end
 
     # Mutable parameter struct
 mutable struct System_p
@@ -70,14 +62,20 @@ mutable struct System_p
     V::Float64
     rthresh::Float64
     dressed_idx::Vector{Int}
-    # preallocated temporaries 
+    # quench controls (minimal)
+    t_quench::Float64      # time at which V is changed (use Inf for "no quench")
+    V_after::Float64       # value of V after t_quench
+    # preallocated temporaries
     _xwrap::Vector{Float64}
     _ising_field::Vector{Float64}
+    _rydberg_force::Vector{Float64}
 end
 
-function System_p(g, ω₀, Δc, κ, temp, N, tspan, N_MC, V, rthresh, dressed_idx)
-    System_p(g, ω₀, Δc, κ, temp, N, tspan, N_MC,  V, rthresh, dressed_idx,
-             zeros(Float64, N), zeros(Float64, N))
+function System_p(g, ω₀, Δc, κ, temp, N, tspan, N_MC, V, rthresh, dressed_idx;
+                  t_quench=Inf, V_after=V)
+    System_p(g, ω₀, Δc, κ, temp, N, tspan, N_MC, V, rthresh, dressed_idx,
+             t_quench, V_after,
+             zeros(Float64, N), zeros(Float64, N), zeros(Float64, N))
 end
 
 
@@ -94,53 +92,85 @@ end
     #     return p.dressed_idx
     # end
 
-
-
 # ----------------------------
+w_func(r) = 1.0
+
+
 function compute_ising_field!(
     ising_field::AbstractVector{Float64},
     xwrap::AbstractVector{<:Real},
     s_z::AbstractVector{<:Real},
     dressed_idx::AbstractVector{<:Integer},
     V::Float64,
-    rthresh::Float64;
-    r_eps::Float64 = 1e-12,    # softening cutoff 
+    Rc::Float64
 )
     N_r = length(dressed_idx)
 
-    @inbounds for ii in 1:length(ising_field)
-        ising_field[ii] = 0.0
-    end
-
-    # short-circuit
+    @inbounds ising_field .= 0.0
     if N_r <= 1
         return
     end
 
-    # loop over unique pairs (p,q) with p<q in dressed_idx
     @inbounds for a in 1:(N_r-1)
-        ia = Int(dressed_idx[a])        
-        xa = Float64(xwrap[ia])
+        ia = dressed_idx[a]
+        xa = xwrap[ia]
+        Pa = 0.5 * (1 + s_z[ia])
+        # Pa = 0.5 * s_z[ia]
         for b in (a+1):N_r
-            ib = Int(dressed_idx[b])    
-            xb = Float64(xwrap[ib])
+            ib = dressed_idx[b]
+            xb = xwrap[ib]
+            Pb = 0.5 * (1 + s_z[ib])
+            # Pb = 0.5 * s_z[ib]
+            dx = xa - xb
+            dx = mod(dx + π, 2π) - π
+            r  = abs(dx)
 
-            dx = abs(xa - xb)
-            dx = mod(dx, 2π)
-            if dx > π
-                dx = 2π - dx
+            # small cutoff
+            if r > 1e-12
+                U = U_softcore(r, V, Rc)
+                ising_field[ia] += U * Pb
+                ising_field[ib] += U * Pa
             end
+        end
+    end
+end
 
-            # apply cutoff and avoid self-interaction 
-            if dx <= rthresh && dx > 0.0
-                #r = max(dx, r_eps)
-                w = 1.0 # / (r^3)
+function compute_rydberg_force!(
+    rydberg_force::AbstractVector{Float64},
+    xwrap::AbstractVector{<:Real},
+    s_z::AbstractVector{<:Real},
+    dressed_idx::AbstractVector{<:Integer},
+    V::Float64,
+    Rc::Float64;
+    r_eps::Float64 = 1e-12
+)
+    N_r = length(dressed_idx)
 
-                # accumulate contributions to both sites
-                s_z_ib = Float64(s_z[ib])
-                s_z_ia = Float64(s_z[ia])
-                ising_field[ia] += 2.0 * V * w * (1.0 + s_z_ib)
-                ising_field[ib] += 2.0 * V * w * (1.0 + s_z_ia)
+    @inbounds rydberg_force .= 0.0
+    if N_r <= 1
+        return
+    end
+
+    @inbounds for a in 1:(N_r-1)
+        ia = dressed_idx[a]
+        xa = xwrap[ia]
+        Pa = 0.5 * (1 + s_z[ia])
+
+        for b in (a+1):N_r
+            ib = dressed_idx[b]
+            xb = xwrap[ib]
+            Pb = 0.5 * (1 + s_z[ib])
+            #Pb = 0.5 * s_z[ib]
+            dx = xa - xb
+            dx = mod(dx + π, 2π) - π
+            r  = abs(dx)
+
+            if r > r_eps
+                dU = dU_softcore_dr(r, V, Rc)
+                f  = -dU * Pa * Pb * sign(dx)
+
+                rydberg_force[ia] += f
+                rydberg_force[ib] -= f
             end
         end
     end
@@ -161,23 +191,31 @@ end
     # ancilla variables
 
     N::Int = p.N
-    g::Float64 = 2*p.g
+    g::Float64 = p.g
     aa::Float64 = (u[5N+1]^2 + u[5N+2]^2 - 0.5) # aᵣ² + aᵢ² - 1/2
-    bb::Float64 = 2p.Δc
-    cc::Float64 = 0.0
+    Δc::Float64 = p.Δc
     dd::Float64 = 0.0
 
-    
+
+
+    # position wrapping
     @inbounds for j in 1:N
         p._xwrap[j] = mod(u[j], 2π)
     end
 
     s_z_view = @view u[(4N+1):(5N)]
 
-    if p.rthresh == 0.0
+    # Quench time and field 
+    Vnow = t < p.t_quench ? p.V : p.V_after
+
+    #gnow = t < p.t_quench ? p.g : p.g_after
+
+    if Vnow == 0.0 || p.rthresh==0
         p._ising_field .= 0.0
+        p._rydberg_force .= 0.0
     else
-        compute_ising_field!(p._ising_field, p._xwrap, s_z_view, p.dressed_idx, p.V, p.rthresh)
+        compute_ising_field!(p._ising_field, p._xwrap, s_z_view, p.dressed_idx, Vnow, p.rthresh)
+        compute_rydberg_force!(p._rydberg_force, p._xwrap, s_z_view, p.dressed_idx, Vnow, p.rthresh)
     end
 
 
@@ -185,19 +223,20 @@ end
         sinuj, cosuj = sincos(u[j])
 
         dd += (g * u[2N+j]) * cosuj
+        
+        h_ising = p._ising_field[j]
+        f_ryd = p._rydberg_force[j]
 
         du[j] = 2u[N+j]
-        du[N+j] = sinuj * g * u[2N+j] * u[5N+1] 
+        du[N+j] = sinuj * 2*g * u[2N+j] * u[5N+1] - 1/2 * f_ryd 
 
-        h_ising = p._ising_field[j]
-
-        du[2N+j] = -u[3N+j] * p.ω₀ + h_ising * u[3N+j]
-        du[3N+j] = u[2N+j] * p.ω₀ - 2cosuj * u[4N+j] * (g * u[5N+1]) - h_ising * u[2N+j]
-        du[4N+j] = 2cosuj * (g * u[3N+j] * u[5N+1])
+        du[2N+j] = -u[3N+j] * p.ω₀ - h_ising * u[3N+j]
+        du[3N+j] = u[2N+j] * p.ω₀ - 4*cosuj * u[4N+j] * (g * u[5N+1]) + h_ising * u[2N+j]
+        du[4N+j] = 4cosuj * (g * u[3N+j] * u[5N+1])
     end
 
-    du[5N+1] = bb/2 * u[5N+2] + cc/2 - p.κ * u[5N+1]
-    du[5N+2] = -bb/2 * u[5N+1] + dd/2 - p.κ * u[5N+2]
+    du[5N+1] = Δc * u[5N+2] - p.κ * u[5N+1]
+    du[5N+2] = -Δc * u[5N+1] + dd/2 - p.κ * u[5N+2]
 end
 
     ###Stochastic part of the SDE (cavity noise alone)####
@@ -218,13 +257,17 @@ end
         u0 = zeros(5N + 2)
 
         u0[1:N] = 2pi.*rand(N) # generate random positions
+        # Place atoms equidistantly
+        # for j in 1:N
+        #     u0[j] = 2pi*(j-1)/N
+        # end
         u0[N+1:2N] = p.temp .* randn(N) # generate random momenta, temp refers to the square root of a temperature unit
 
-        u0[2N+1:4N] = 2bitrand(2N) .- 1  # σˣⱼ and σʸⱼ are 1 or -1  + add some Gaussian noise of 0 mean.
+        u0[2N+1:4N] = 2bitrand(2N) .- 1  # σˣⱼ and σʸⱼ are 1 or -1  
         # for j in 4N+1:5N
         #     u0[j] = (-1)^(j-1) # Neel order
         # end
-        u0[4N+1:5N] .=  -1 # σᶻⱼ = -1, atoms in the ground state + add some Gaussian noise of 0 mean.
+        u0[4N+1:5N] .=  -1 # σᶻⱼ = -1, atoms in the ground state
 
         u0[5N+1:end] .= 0 # cavity empty
         return u0
@@ -264,10 +307,6 @@ end
     end
     
 
-    function sim_quench(sim::Array{Sol,1}, p::System_p, deltat::Real)
-        monte_prob = quench_prob(sim, p, deltat)
-        sim_quench =  solve(monte_prob, SOSRA2(), EnsembleThreads(), trajectories=length(sim), saveat=0.01, progress=true)
-    end
 
 #######################################
 #        POST PROCESSING              #   
@@ -292,22 +331,6 @@ function regenerate_prob(sim::Array{Sol,1},deltat::Real)
     prob =  regenerate_prob(sim[1],deltat)
     function prob_func(prob,i,repeat)
         regenerate_prob(sim[i],deltat)
-    end
-
-    monte_prob = EnsembleProblem(prob,prob_func=prob_func)
-end
-
-function quench_prob(sol::Sol, p::System_p, deltat::Real)
-    u0 = sol.u[:,end]
-    tspan = (sol.t[end], sol.t[end]+deltat)
-    prob = SDEProblem(f_det,f_noise,u0,tspan,p)
-end
-
-
-function quench_prob(sim::Array{Sol,1}, p::System_p, deltat::Real)
-    prob =  quench_prob(sim[1], p, deltat)
-    function prob_func(prob,i,repeat)
-        quench_prob(sim[i], p, deltat)
     end
 
     monte_prob = EnsembleProblem(prob,prob_func=prob_func)
@@ -386,197 +409,31 @@ function sim2df(sim::Array{Sol,1})
 end
 
 
-
-
-######################################################################
-
-############################## OBSERVABLES ###########################
-
-######################################################################
-
-Base.@kwdef struct Observable
-    s_traj
-    formula::String
-    short_name::String = formula
-    name::String = short_name
-    params::Dict = Dict()  # New field for additional parameters
-end
-
-Observable(s_traj,formula,short_name) = Observable(s_traj=s_traj,formula=formula,short_name=short_name)
-Observable(s_traj,formula) = Observable(s_traj=s_traj,formula=formula)
-
-function expect(o::Observable,sol::RODESolution)
-    sol_ = extract_solution(sol)[1]
-    expect(o,sol_)
-end
-
-function expect(o::Observable,sim::EnsembleSolution)
-    sim_ = extract_solution(sim)
-    expect(o,sim_)
-end
-
-function expect(o::Observable,sol::Sol;params=Dict())
-    # Merge any params passed to expect with params in the Observable
-    all_params = merge(o.params, params)
-    o.s_traj(sol, all_params)
-end
-
-function expect_full(o::Observable, sim::Array{Sol,1}; params=Dict())
-    [expect(o, sim[j]; params=params) for j=1:length(sim)]
-end
-
-function expect(o::Observable, sim::Array{Sol,1}; params=Dict())
-    Os = expect_full(o, sim; params=params)
-    Omean = mean(Os)
-    Ostd = stdm(Os, Omean)
-    bb = hcat(Os...)
-    Oq90 = [quantile(bb[i,:], [0.05, 0.95]) for i in 1:size(bb)[1]]
-
-    return Omean, Ostd, Oq90
-end
-
-### Define observables of interest below
-
-obs_adaga = Observable(
-(sol, params) -> begin
-    N = sol.p.N
-    return  [sum(sol.u[5N+1:5N+2,j].^2) for j=1:length(sol.t)]
-end,
-"adaga", "adaga = ⟨a^†a⟩"
-)
-
-obs_adaga2 = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        Nt = length(sol.t)
-        out = Array{Float64}(undef, Nt)
-        for j in 1:Nt
-            n = sum(sol.u[5N+1:5N+2, j].^2)   
-            out[j] = n^2                       
-        end
-        return out
-    end,
-    "adaga2",
-    "adaga2 = ⟨(a^†a)^2⟩"
-)
-
-obs_ar = Observable(
-(sol, params) -> begin
-    N = sol.p.N
-    return      [sol.u[5N+1,j] for j=1:length(sol.t)]
-end,
-"a_r", "a_r = ⟨a_r⟩"
-)
-
-obs_ai = Observable(
-(sol, params) -> begin
-    N = sol.p.N
-    return      [sol.u[5N+2,j] for j=1:length(sol.t)]
-end,
-"a_i", "a_i = ⟨a_i⟩"
-)
-
-
-obs_Cos2 = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return       [mean(cos.(sol.u[1:N,j]).^2) for j=1:length(sol.t)]
-    end,
-    "B", "⟨B⟩ = Σ_j cos(x_j)^2"
-)
-
-obs_Cos = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return       [mean(cos.(sol.u[1:N,j])) for j=1:length(sol.t)]
-    end,
-    "Theta", "⟨Θ⟩ = Σ_j cos(x_j)"
-)
-
-
-# X = ∑ⱼσₓʲ cos(xⱼ)/N
-obs_X = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return   [mean((sol.u[2N+1:3N,j].*cos.(sol.u[1:N,j]))) for j=1:length(sol.t)]
-    end,
-    "CollectiveX", "X = Σ_j cos(x_j) σ^x_j"
-)
-
-obs_X2 = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return   [mean((sol.u[2N+1:3N,j].*cos.(sol.u[1:N,j]))).^2 for j=1:length(sol.t)]
-    end,
-    "CollectiveX2", "X^2 = Σ_j cos(x_j)^2 σ^x_j^2"
-)
-
-
-# Z =  ∑ⱼσ\_zʲ⋅cos(xⱼ)/N
-obs_Z = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return   [mean((sol.u[4N+1:5N,j].*cos.(sol.u[1:N,j]))) for j=1:length(sol.t)]
-    end,
-    "CollectiveZ", "Z = Σ_j cos(x_j) σ^z_j"
-)
-
-
-# Jz =  ∑ⱼσ\_zʲ/N
-obs_Jz = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return   [mean((sol.u[4N+1:5N,j])) for j=1:length(sol.t)]
-    end,
-    "CollectiveJz", "Jz = Σ_j  σ^z_j"
-)
-
-obs_Ekin = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return       [mean(sol.u[N+1:2N,j].^2) for j=1:length(sol.t)]
-    end,
-    "p^2_j", "Ekin = Σ_j  p^2_j"
-)
-
-obs_kurt = Observable(
-    (sol, params) -> begin
-        N = sol.p.N
-        return   [mean(sol.u[N+1:2N,j].^4)./mean(sol.u[N+1:2N,j].^2).^2 for j=1:length(sol.t)]
-    end,
-    "Kurtosis", "K = Σ_j  p^4_j / (p^2_j)^2"
-)
-
 ############ HELPERS ###########
 
-function categorize_traj(sol::Sol) #categorise the broken Z₂ symmetry X,Y states
-    expect(obs_X,sol)[end] >=0 ? x=1 : x=-1
+function categorize_traj(sol::Sol) #categorise the broken Z₂ symmetry X (Y) states
+    expect(X,sol)[end] >=0 ? x=1 : x=-1
     return x
 end
 
-function categorize_traj(sim::Array)
-    
-    sols = try
-        extract_solution(sim)
-    catch
-        sim
-    end
+function categorize_traj(sol::Sol, obs::Observable) # Observable-dependent choice
+    expect(obs,sol)[end] >=0 ? x=1 : x=-1
+    return x
+end
+
+
+
+function categorize_traj(sim::Array{Sol,1})
 
     plus_sols = Sol[]
     minus_sols = Sol[]
     other_sols = Sol[]
 
-    for sol in sols
-        cat = try
-            categorize_traj(sol)
-        catch err
-            @warn "categorize_traj(sol) threw an error for a trajectory; classifying as 'other'. Error: $err"
-            0
-        end
-
-        if cat > 1e-9
+    for sol in sim
+        cat = categorize_traj(sol)
+        if cat == 1
             push!(plus_sols, sol)
-        elseif cat <-1e-9
+        elseif cat == -1
             push!(minus_sols, sol)
         else
             push!(other_sols, sol)
@@ -587,3 +444,23 @@ function categorize_traj(sim::Array)
 end
 
 
+function categorize_traj(sim::Array{Sol,1}, obs::Observable)
+
+    plus_sols = Sol[]
+    minus_sols = Sol[]
+    other_sols = Sol[]
+
+    for sol in sim
+        cat = categorize_traj(sol, obs)
+        if cat == 1
+            push!(plus_sols, sol)
+        elseif cat == -1
+            push!(minus_sols, sol)
+        else
+            push!(other_sols, sol)
+        end
+    end
+
+    return plus_sols, minus_sols, other_sols
+end
+# end # module
